@@ -5,7 +5,12 @@ from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
+from app.core.security import request_fingerprint
 from app.forensics.repository import ForensicRepository, record
+
+QUANTITY_RESOLUTION = 1e-6
+# 对整条谱系而言属于“材料离开谱系”的流水；分取是谱系内部转移，不计入。
+EXTERNAL_MOVEMENTS = ("取样", "领用", "归还", "报废", "盘点调整")
 
 
 class CustodyService:
@@ -45,36 +50,132 @@ class CustodyService:
         return self.repository.location_detail(location_id)
 
     def create_specimen(self, data: dict[str, Any]) -> dict[str, Any]:
+        if data.get("parent_specimen_id"):
+            return self._create_aliquot(data)
+        return self._create_intake(data)
+
+    def _create_intake(self, data: dict[str, Any]) -> dict[str, Any]:
+        """普通到案检材：经原入口登记，数量即为初始可用量，与来源检材无关。"""
         forensic_case = self.repository.require_forensic_case(int(data["case_id"]))
         if forensic_case["status"] not in {"accepted", "restricted", "quarantine"}:
             raise ConflictError("案件尚未受理，不能登记检材")
-        parent = None
-        if data.get("parent_specimen_id"):
-            parent = self.repository.require_specimen(int(data["parent_specimen_id"]))
-            if int(parent["case_id"]) != int(data["case_id"]):
-                raise ValidationError("子检材必须与来源检材属于同一案件")
         timestamp = to_storage(self.clock.now())
         try:
             cursor = self.connection.execute(
                 "INSERT INTO specimens(specimen_no,case_id,parent_specimen_id,received_year,initial_quantity,"
                 "available_quantity,integrity_percent,packaging,sealed_on,status,created_by,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
+                "VALUES(?,?,NULL,?,?,?,?,?,?,'pending',?,?,?)",
                 (
-                    data["specimen_no"], data["case_id"], data.get("parent_specimen_id"), data["received_year"],
+                    data["specimen_no"], data["case_id"], data["received_year"],
                     data["initial_quantity"], data["initial_quantity"], data.get("integrity_percent"),
                     data.get("packaging", ""), data.get("sealed_on"), data["created_by"], timestamp, timestamp,
                 ),
             )
         except sqlite3.IntegrityError as exc:
             raise ConflictError("检材编号已经存在") from exc
-        specimen_id = int(cursor.lastrowid)
-        if parent:
-            self.connection.execute(
-                "INSERT INTO custody_events(specimen_id,movement_type,quantity,idempotency_key,actor,reason,created_at) "
-                "VALUES(?,'盘点调整',0,?,?,?,?)",
-                (specimen_id, f"lineage-{specimen_id}", data["created_by"], f"由来源检材 {parent['specimen_no']} 分取", timestamp),
+        return self.repository.specimen_detail(int(cursor.lastrowid))
+
+    def _create_aliquot(self, data: dict[str, Any]) -> dict[str, Any]:
+        """带来源检材的登记只能是一次原子分取：校验、扣减、立谱在同一事务内完成。"""
+        parent_id = int(data["parent_specimen_id"])
+        missing = [
+            name for name in ("expected_parent_version", "idempotency_key", "business_reason")
+            if data.get(name) is None
+        ]
+        if missing:
+            raise ValidationError(f"带来源检材的分取登记必须提供：{','.join(missing)}")
+        key = str(data["idempotency_key"]).strip()
+        reason = str(data["business_reason"]).strip()
+        expected_version = int(data["expected_parent_version"])
+        quantity = round(float(data["initial_quantity"]), 6)
+        if quantity <= 0:
+            raise ValidationError("分取数量必须为正数")
+        if not reason:
+            raise ValidationError("分取登记必须填写业务理由")
+
+        # 同业务键重试：请求一致则返回最初子检材，内容变化明确报冲突。
+        existing = self.repository.aliquot_by_key(key)
+        if existing is not None:
+            if existing["request_hash"] != request_fingerprint(data):
+                raise ConflictError("同一业务键对应了不同的分取请求", context={"child_specimen_id": existing["child_specimen_id"]})
+            return self.repository.specimen_detail(int(existing["child_specimen_id"]))
+
+        parent = self.repository.require_specimen(parent_id)
+        if int(parent["case_id"]) != int(data["case_id"]):
+            raise ValidationError("子检材必须与来源检材属于同一案件")
+        if parent["status"] in {"depleted", "disposed"}:
+            raise ConflictError("来源检材已经耗尽或销毁，不能分取")
+        if parent["status"] == "held" or self.repository.active_holds(parent_id):
+            raise ConflictError("来源检材处于冻结状态，不能分取", context={
+                "holds": [item["id"] for item in self.repository.active_holds(parent_id)]
+            })
+        if int(parent["version"]) != expected_version:
+            raise ConflictError("来源检材版本冲突", context={"current_version": parent["version"]})
+        if quantity > float(parent["available_quantity"]) + QUANTITY_RESOLUTION:
+            raise ConflictError("分取数量超过来源检材可用数量", context={
+                "requested_grams": quantity,
+                "available_grams": float(parent["available_quantity"]),
+            })
+
+        timestamp = to_storage(self.clock.now())
+        before = round(float(parent["available_quantity"]), 6)
+        after = round(before - quantity, 6)
+        parent_status = "depleted" if after <= QUANTITY_RESOLUTION else parent["status"]
+        try:
+            child_cursor = self.connection.execute(
+                "INSERT INTO specimens(specimen_no,case_id,parent_specimen_id,received_year,initial_quantity,"
+                "available_quantity,integrity_percent,packaging,sealed_on,status,created_by,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
+                (
+                    data["specimen_no"], data["case_id"], parent_id, data["received_year"],
+                    quantity, quantity, data.get("integrity_percent"),
+                    data.get("packaging", ""), data.get("sealed_on"), data["created_by"], timestamp, timestamp,
+                ),
             )
-        return self.repository.specimen_detail(specimen_id)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("检材编号已经存在") from exc
+        child_id = int(child_cursor.lastrowid)
+
+        try:
+            updated = self.connection.execute(
+                "UPDATE specimens SET available_quantity=?,status=?,version=version+1,updated_at=? "
+                "WHERE id=? AND version=? AND available_quantity>=?",
+                (after, parent_status, timestamp, parent_id, expected_version, quantity),
+            )
+        except sqlite3.IntegrityError:
+            raise ConflictError("并发分取导致来源可用量不足")
+        if updated.rowcount != 1:
+            current = self.repository.require_specimen(parent_id)
+            if int(current["version"]) != expected_version:
+                raise ConflictError("来源检材版本冲突", context={"current_version": current["version"]})
+            raise ConflictError("来源检材可用数量不足", context={"available_grams": current["available_quantity"]})
+
+        self.connection.execute(
+            "INSERT INTO custody_events(specimen_id,movement_type,quantity,idempotency_key,actor,reason,created_at) "
+            "VALUES(?, '分取', ?, ?, ?, ?, ?)",
+            (
+                parent_id, -quantity, f"aliquot-parent-{child_id}", data["created_by"],
+                f"分取给子检材 {data['specimen_no']}：{reason}", timestamp,
+            ),
+        )
+        self.connection.execute(
+            "INSERT INTO custody_events(specimen_id,movement_type,quantity,idempotency_key,actor,reason,created_at) "
+            "VALUES(?, '分取', ?, ?, ?, ?, ?)",
+            (
+                child_id, quantity, f"aliquot-child-{child_id}", data["created_by"],
+                f"由来源检材 {parent['specimen_no']} 分取：{reason}", timestamp,
+            ),
+        )
+        self.connection.execute(
+            "INSERT INTO specimen_aliquots(parent_specimen_id,child_specimen_id,case_id,quantity,"
+            "parent_available_before,parent_available_after,parent_version_before,business_reason,"
+            "idempotency_key,request_hash,actor,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                parent_id, child_id, int(data["case_id"]), quantity, before, after, expected_version,
+                reason, key, request_fingerprint(data), data["created_by"], timestamp,
+            ),
+        )
+        return self.repository.specimen_detail(child_id)
 
     def place_specimen(self, data: dict[str, Any]) -> dict[str, Any]:
         previous = self.repository.custody_event_by_key(data["idempotency_key"])
@@ -222,20 +323,86 @@ class CustodyService:
         return record(self.connection.execute("SELECT * FROM specimen_holds WHERE id=?", (hold_id,)).fetchone()) or {}
 
     def reconcile(self, specimen_id: int) -> dict[str, Any]:
-        specimen = self.repository.require_specimen(specimen_id)
-        movement_total = float(self.connection.execute(
-            "SELECT COALESCE(SUM(quantity),0) FROM custody_events WHERE specimen_id=? AND movement_type IN ('取样','领用','报废','归还','盘点调整')",
-            (specimen_id,),
+        """对整条谱系做守恒核对：到案初始量 = 谱系现存可用量 + 离开谱系的外部流水。"""
+        root_id = self.repository.lineage_root_id(specimen_id)
+        tree_ids = self.repository.lineage_tree_ids(root_id)
+        placeholders = ",".join("?" for _ in tree_ids)
+        members = [
+            record(row) or {}
+            for row in self.connection.execute(f"SELECT * FROM specimens WHERE id IN ({placeholders})", tree_ids).fetchall()
+        ]
+        root = self.repository.require_specimen(root_id)
+        movement_clause = ",".join("?" for _ in EXTERNAL_MOVEMENTS)
+
+        external_total = float(self.connection.execute(
+            f"SELECT COALESCE(SUM(quantity),0) FROM custody_events WHERE specimen_id IN ({placeholders}) "
+            f"AND movement_type IN ({movement_clause})",
+            (*tree_ids, *EXTERNAL_MOVEMENTS),
         ).fetchone()[0])
-        expected_available = round(float(specimen["initial_quantity"]) + movement_total, 6)
-        placed_weight = float(self.connection.execute(
-            "SELECT COALESCE(SUM(quantity),0) FROM specimen_placements WHERE specimen_id=? AND removed_at IS NULL", (specimen_id,)
+        aliquoted_out = float(self.connection.execute(
+            f"SELECT COALESCE(SUM(quantity),0) FROM specimen_aliquots WHERE parent_specimen_id IN ({placeholders})",
+            tree_ids,
         ).fetchone()[0])
+        child_initial = round(
+            sum(float(m["initial_quantity"]) for m in members if int(m["id"]) != root_id), 6
+        )
+
+        node_checks: list[dict[str, Any]] = []
+        placements_total = 0.0
+        placements_ok = True
+        for member in members:
+            member_id = int(member["id"])
+            outgoing = self.repository.aliquots_of_parent(member_id)
+            outgoing_total = round(sum(float(item["quantity"]) for item in outgoing), 6)
+            node_external = float(self.connection.execute(
+                f"SELECT COALESCE(SUM(quantity),0) FROM custody_events WHERE specimen_id=? "
+                f"AND movement_type IN ({movement_clause})",
+                (member_id, *EXTERNAL_MOVEMENTS),
+            ).fetchone()[0])
+            node_expected = round(
+                float(member["initial_quantity"]) - outgoing_total + node_external, 6
+            )
+            placed_weight = float(self.connection.execute(
+                "SELECT COALESCE(SUM(quantity),0) FROM specimen_placements WHERE specimen_id=? AND removed_at IS NULL",
+                (member_id,),
+            ).fetchone()[0])
+            placements_total += placed_weight
+            within = placed_weight <= float(member["available_quantity"]) + 1e-6
+            placements_ok = placements_ok and within
+            node_checks.append({
+                "specimen_id": member_id,
+                "specimen_no": member["specimen_no"],
+                "parent_specimen_id": member["parent_specimen_id"],
+                "recorded_available_grams": round(float(member["available_quantity"]), 6),
+                "expected_available_grams": node_expected,
+                "available_matches_ledger": abs(float(member["available_quantity"]) - node_expected) < 1e-6,
+                "active_placement_grams": round(placed_weight, 6),
+                "placements_within_available": within,
+            })
+
+        recorded_available = round(sum(float(m["available_quantity"]) for m in members), 6)
+        expected_available = round(float(root["initial_quantity"]) + external_total, 6)
+        queried = next(item for item in node_checks if item["specimen_id"] == specimen_id)
         return {
             "specimen_id": specimen_id,
-            "recorded_available_grams": specimen["available_quantity"],
-            "expected_available_grams": expected_available,
-            "active_placement_grams": placed_weight,
-            "available_matches_ledger": abs(float(specimen["available_quantity"]) - expected_available) < 1e-6,
-            "placements_within_available": placed_weight <= float(specimen["available_quantity"]) + 1e-6,
+            "root_specimen_id": root_id,
+            "lineage_specimen_ids": tree_ids,
+            "root_initial_grams": round(float(root["initial_quantity"]), 6),
+            "recorded_available_grams": queried["recorded_available_grams"],
+            "expected_available_grams": queried["expected_available_grams"],
+            "active_placement_grams": queried["active_placement_grams"],
+            "available_matches_ledger": queried["available_matches_ledger"],
+            "placements_within_available": queried["placements_within_available"],
+            "lineage": {
+                "recorded_available_grams": recorded_available,
+                "expected_available_grams": expected_available,
+                "active_placement_grams": round(placements_total, 6),
+                "aliquoted_grams": round(aliquoted_out, 6),
+                "child_initial_grams": child_initial,
+                "external_movement_grams": round(external_total, 6),
+                "lineage_conserved": abs(recorded_available - expected_available) < 1e-6
+                and abs(aliquoted_out - child_initial) < 1e-6,
+                "placements_within_available": placements_ok,
+            },
+            "members": node_checks,
         }

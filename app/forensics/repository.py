@@ -132,6 +132,14 @@ class ForensicRepository:
             "SELECT * FROM examinations WHERE specimen_id=? AND status='completed' ORDER BY completed_at DESC,id DESC LIMIT 1",
             (specimen_id,),
         ).fetchone())
+        origin = self.aliquot_by_child(specimen_id)
+        if origin:
+            origin["parent"] = self.require_specimen(int(origin["parent_specimen_id"]))
+        item["aliquot_origin"] = origin
+        item["aliquots"] = []
+        for aliquot in self.aliquots_of_parent(specimen_id):
+            aliquot["child"] = self.require_specimen(int(aliquot["child_specimen_id"]))
+            item["aliquots"].append(aliquot)
         return item
 
     def require_placement(self, placement_id: int) -> dict[str, Any]:
@@ -142,6 +150,41 @@ class ForensicRepository:
 
     def custody_event_by_key(self, key: str) -> dict[str, Any] | None:
         return record(self.connection.execute("SELECT * FROM custody_events WHERE idempotency_key=?", (key,)).fetchone())
+
+    def aliquot_by_key(self, key: str) -> dict[str, Any] | None:
+        return record(self.connection.execute(
+            "SELECT * FROM specimen_aliquots WHERE idempotency_key=?", (key,)
+        ).fetchone())
+
+    def aliquot_by_child(self, child_specimen_id: int) -> dict[str, Any] | None:
+        return record(self.connection.execute(
+            "SELECT * FROM specimen_aliquots WHERE child_specimen_id=?", (child_specimen_id,)
+        ).fetchone())
+
+    def aliquots_of_parent(self, parent_specimen_id: int) -> list[dict[str, Any]]:
+        return records(self.connection.execute(
+            "SELECT * FROM specimen_aliquots WHERE parent_specimen_id=? ORDER BY id", (parent_specimen_id,)
+        ).fetchall())
+
+    def lineage_tree_ids(self, root_specimen_id: int) -> list[int]:
+        rows = self.connection.execute(
+            "WITH RECURSIVE tree(id) AS ("
+            "SELECT id FROM specimens WHERE id=? "
+            "UNION ALL SELECT s.id FROM specimens s JOIN tree t ON s.parent_specimen_id=t.id"
+            ") SELECT id FROM tree ORDER BY id",
+            (root_specimen_id,),
+        ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def lineage_root_id(self, specimen_id: int) -> int:
+        rows = self.connection.execute(
+            "WITH RECURSIVE up(id,parent_specimen_id,depth) AS ("
+            "SELECT id,parent_specimen_id,0 FROM specimens WHERE id=? "
+            "UNION ALL SELECT s.id,s.parent_specimen_id,u.depth+1 FROM specimens s JOIN up u ON s.id=u.parent_specimen_id"
+            ") SELECT id FROM up ORDER BY depth DESC LIMIT 1",
+            (specimen_id,),
+        ).fetchall()
+        return int(rows[0][0])
 
     def require_protocol(self, protocol_id: int) -> dict[str, Any]:
         item = record(self.connection.execute("SELECT * FROM examination_protocols WHERE id=?", (protocol_id,)).fetchone())

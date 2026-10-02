@@ -207,6 +207,7 @@ CREATE TABLE IF NOT EXISTS specimens (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lots_forensic_case ON specimens(case_id,status);
+CREATE INDEX IF NOT EXISTS idx_specimens_parent ON specimens(parent_specimen_id);
 CREATE TABLE IF NOT EXISTS specimen_placements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE CASCADE,
@@ -223,7 +224,7 @@ CREATE TABLE IF NOT EXISTS custody_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE CASCADE,
     placement_id INTEGER REFERENCES specimen_placements(id),
-    movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','归还','报废','盘点调整')),
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','归还','报废','盘点调整','分取')),
     quantity REAL NOT NULL,
     from_location_id INTEGER REFERENCES storage_locations(id),
     to_location_id INTEGER REFERENCES storage_locations(id),
@@ -245,6 +246,38 @@ CREATE TABLE IF NOT EXISTS specimen_holds (
     release_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_holds_active ON specimen_holds(specimen_id,released_at);
+CREATE TABLE IF NOT EXISTS specimen_aliquots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_specimen_id INTEGER NOT NULL REFERENCES specimens(id) ON DELETE RESTRICT,
+    child_specimen_id INTEGER NOT NULL UNIQUE REFERENCES specimens(id) ON DELETE RESTRICT,
+    case_id INTEGER NOT NULL REFERENCES forensic_cases(id) ON DELETE RESTRICT,
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    parent_available_before REAL NOT NULL,
+    parent_available_after REAL NOT NULL,
+    parent_version_before INTEGER NOT NULL,
+    business_reason TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_aliquots_parent ON specimen_aliquots(parent_specimen_id,id);
+CREATE TRIGGER IF NOT EXISTS trg_aliquots_immutable_update
+BEFORE UPDATE ON specimen_aliquots
+BEGIN
+    SELECT RAISE(ABORT,'谱系流转记录不可修改');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_aliquots_immutable_delete
+BEFORE DELETE ON specimen_aliquots
+BEGIN
+    SELECT RAISE(ABORT,'谱系流转记录不可删除');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_specimens_parent_immutable
+BEFORE UPDATE OF parent_specimen_id ON specimens
+WHEN OLD.parent_specimen_id IS NOT NULL AND NEW.parent_specimen_id IS NOT OLD.parent_specimen_id
+BEGIN
+    SELECT RAISE(ABORT,'来源检材关系确立后不得改写');
+END;
 
 CREATE TABLE IF NOT EXISTS examination_protocols (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

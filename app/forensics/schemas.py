@@ -131,11 +131,33 @@ class SpecimenCreate(BaseModel):
     packaging: str = Field(default="", max_length=500)
     sealed_on: date | None = None
     created_by: str = Field(min_length=1, max_length=100)
+    expected_parent_version: int | None = Field(default=None, gt=0)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=100)
+    business_reason: str | None = Field(default=None, max_length=500)
 
     @field_validator("specimen_no")
     @classmethod
     def normalize_specimen_no(cls, value: str) -> str:
         return value.strip().upper()
+
+    @model_validator(mode="after")
+    def validate_aliquot_fields(self) -> "SpecimenCreate":
+        if self.parent_specimen_id is None:
+            return self
+        missing = [
+            name for name, value in (
+                ("expected_parent_version", self.expected_parent_version),
+                ("idempotency_key", self.idempotency_key),
+                ("business_reason", self.business_reason),
+            ) if value is None
+        ]
+        if missing:
+            raise ValueError(f"带来源检材的分取登记必须提供：{','.join(missing)}")
+        if not str(self.business_reason).strip():
+            raise ValueError("分取登记必须填写业务理由")
+        if self.idempotency_key and not self.idempotency_key.strip():
+            raise ValueError("分取业务键不能为空")
+        return self
 
 
 class PlacementCreate(BaseModel):
