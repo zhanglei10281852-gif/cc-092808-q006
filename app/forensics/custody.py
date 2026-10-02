@@ -5,7 +5,15 @@ from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
-from app.forensics.repository import ForensicRepository, record
+from app.core.security import request_fingerprint
+from app.forensics.repository import ForensicRepository, record, records
+
+LEDGER_MOVEMENT_TYPES = ("取样", "领用", "报废", "归还", "盘点调整", "分取")
+CONSUMPTION_MOVEMENT_TYPES = ("取样", "领用", "报废", "归还", "盘点调整")
+
+
+def _movement_clause(movement_types: tuple[str, ...]) -> str:
+    return ",".join(f"'{item}'" for item in movement_types)
 
 
 class CustodyService:
@@ -48,33 +56,121 @@ class CustodyService:
         forensic_case = self.repository.require_forensic_case(int(data["case_id"]))
         if forensic_case["status"] not in {"accepted", "restricted", "quarantine"}:
             raise ConflictError("案件尚未受理，不能登记检材")
-        parent = None
         if data.get("parent_specimen_id"):
-            parent = self.repository.require_specimen(int(data["parent_specimen_id"]))
-            if int(parent["case_id"]) != int(data["case_id"]):
-                raise ValidationError("子检材必须与来源检材属于同一案件")
+            raise ValidationError("带来源检材必须通过分取接口原子登记，不能借父标识绕过数量守恒")
         timestamp = to_storage(self.clock.now())
         try:
             cursor = self.connection.execute(
                 "INSERT INTO specimens(specimen_no,case_id,parent_specimen_id,received_year,initial_quantity,"
                 "available_quantity,integrity_percent,packaging,sealed_on,status,created_by,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
+                "VALUES(?,?,NULL,?,?,?,?,?,?,'pending',?,?,?)",
                 (
-                    data["specimen_no"], data["case_id"], data.get("parent_specimen_id"), data["received_year"],
+                    data["specimen_no"], data["case_id"], data["received_year"],
                     data["initial_quantity"], data["initial_quantity"], data.get("integrity_percent"),
                     data.get("packaging", ""), data.get("sealed_on"), data["created_by"], timestamp, timestamp,
                 ),
             )
         except sqlite3.IntegrityError as exc:
             raise ConflictError("检材编号已经存在") from exc
-        specimen_id = int(cursor.lastrowid)
-        if parent:
-            self.connection.execute(
-                "INSERT INTO custody_events(specimen_id,movement_type,quantity,idempotency_key,actor,reason,created_at) "
-                "VALUES(?,'盘点调整',0,?,?,?,?)",
-                (specimen_id, f"lineage-{specimen_id}", data["created_by"], f"由来源检材 {parent['specimen_no']} 分取", timestamp),
+        return self.repository.specimen_detail(int(cursor.lastrowid))
+
+    def split_specimen(self, parent_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        parent = self.repository.require_specimen(parent_id)
+        payload = {
+            "parent_specimen_id": int(parent["id"]),
+            "specimen_no": data["specimen_no"],
+            "quantity": float(data["quantity"]),
+            "expected_version": int(data["expected_version"]),
+            "reason": data["reason"],
+            "actor": data["actor"],
+            "packaging": data["packaging"],
+            "sealed_on": data["sealed_on"],
+            "integrity_percent": data.get("integrity_percent"),
+            "received_year": data.get("received_year") or int(parent["received_year"]),
+        }
+        fingerprint = request_fingerprint(payload)
+        existing = self.repository.split_by_key(data["idempotency_key"])
+        if existing:
+            if existing["request_hash"] != fingerprint:
+                raise ConflictError("同一分取业务键对应了不同的请求内容", context={"split_id": existing["id"]})
+            return self._split_result(existing, replayed=True)
+        forensic_case = self.repository.require_forensic_case(int(parent["case_id"]))
+        if forensic_case["status"] not in {"accepted", "restricted", "quarantine"}:
+            raise ConflictError("案件当前状态不允许分取检材")
+        if parent["status"] in {"depleted", "disposed"}:
+            raise ConflictError("来源检材已经耗尽或销毁，不能分取")
+        holds = self.repository.active_holds(int(parent["id"]))
+        if holds:
+            raise ConflictError("来源检材存在未解除的保全、质量或权限冻结", context={"holds": [item["id"] for item in holds]})
+        quantity = float(data["quantity"])
+        available = float(parent["available_quantity"])
+        if quantity > available + 1e-9:
+            raise ConflictError("来源检材可用数量不足", context={"available_quantity": available})
+        if int(parent["version"]) != int(data["expected_version"]):
+            raise ConflictError("来源检材版本冲突", context={"current_version": parent["version"]})
+        if self.connection.execute(
+            "SELECT 1 FROM specimens WHERE specimen_no=?", (data["specimen_no"],)
+        ).fetchone():
+            raise ConflictError("检材编号已经存在")
+        timestamp = to_storage(self.clock.now())
+        remaining = round(available - quantity, 6)
+        status = "depleted" if remaining <= 1e-9 else parent["status"]
+        updated = self.connection.execute(
+            "UPDATE specimens SET available_quantity=?,status=?,version=version+1,updated_at=? "
+            "WHERE id=? AND version=? AND available_quantity>=?",
+            (remaining, status, timestamp, parent["id"], data["expected_version"], quantity),
+        )
+        if updated.rowcount != 1:
+            raise ConflictError("来源检材版本冲突或可用数量不足")
+        try:
+            cursor = self.connection.execute(
+                "INSERT INTO specimens(specimen_no,case_id,parent_specimen_id,received_year,initial_quantity,"
+                "available_quantity,integrity_percent,packaging,sealed_on,status,created_by,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
+                (
+                    data["specimen_no"], parent["case_id"], parent["id"], payload["received_year"], quantity, quantity,
+                    data.get("integrity_percent"), data["packaging"], data["sealed_on"], data["actor"], timestamp, timestamp,
+                ),
             )
-        return self.repository.specimen_detail(specimen_id)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("检材编号已经存在") from exc
+        child_id = int(cursor.lastrowid)
+        try:
+            split_cursor = self.connection.execute(
+                "INSERT INTO specimen_splits(split_key,request_hash,case_id,parent_specimen_id,child_specimen_id,quantity,"
+                "parent_available_before,parent_available_after,reason,actor,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    data["idempotency_key"], fingerprint, parent["case_id"], parent["id"], child_id, quantity,
+                    available, remaining, data["reason"], data["actor"], timestamp,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("分取业务键已经存在") from exc
+        self.connection.execute(
+            "INSERT INTO custody_events(specimen_id,movement_type,quantity,idempotency_key,actor,reason,created_at) "
+            "VALUES(?,'分取',?,?,?,?,?)",
+            (parent["id"], -quantity, f"{data['idempotency_key']}:parent", data["actor"], data["reason"], timestamp),
+        )
+        self.connection.execute(
+            "INSERT INTO custody_events(specimen_id,movement_type,quantity,idempotency_key,actor,reason,created_at) "
+            "VALUES(?,'分取',0,?,?,?,?)",
+            (
+                child_id, f"{data['idempotency_key']}:child", data["actor"],
+                f"自来源检材 {parent['specimen_no']} 分取建立新封识", timestamp,
+            ),
+        )
+        split = record(self.connection.execute(
+            "SELECT * FROM specimen_splits WHERE id=?", (int(split_cursor.lastrowid),)
+        ).fetchone())
+        return self._split_result(split or {}, replayed=False)
+
+    def _split_result(self, split: dict[str, Any], *, replayed: bool) -> dict[str, Any]:
+        return {
+            "split": split,
+            "parent": self.repository.specimen_detail(int(split["parent_specimen_id"])),
+            "child": self.repository.specimen_detail(int(split["child_specimen_id"])),
+            "replayed": replayed,
+        }
 
     def place_specimen(self, data: dict[str, Any]) -> dict[str, Any]:
         previous = self.repository.custody_event_by_key(data["idempotency_key"])
@@ -224,7 +320,8 @@ class CustodyService:
     def reconcile(self, specimen_id: int) -> dict[str, Any]:
         specimen = self.repository.require_specimen(specimen_id)
         movement_total = float(self.connection.execute(
-            "SELECT COALESCE(SUM(quantity),0) FROM custody_events WHERE specimen_id=? AND movement_type IN ('取样','领用','报废','归还','盘点调整')",
+            f"SELECT COALESCE(SUM(quantity),0) FROM custody_events WHERE specimen_id=? "
+            f"AND movement_type IN ({_movement_clause(LEDGER_MOVEMENT_TYPES)})",
             (specimen_id,),
         ).fetchone()[0])
         expected_available = round(float(specimen["initial_quantity"]) + movement_total, 6)
@@ -238,4 +335,66 @@ class CustodyService:
             "active_placement_grams": placed_weight,
             "available_matches_ledger": abs(float(specimen["available_quantity"]) - expected_available) < 1e-6,
             "placements_within_available": placed_weight <= float(specimen["available_quantity"]) + 1e-6,
+            "lineage": self._lineage_conservation(specimen),
+        }
+
+    def _lineage_conservation(self, specimen: dict[str, Any]) -> dict[str, Any]:
+        root = specimen
+        seen = {int(root["id"])}
+        while root.get("parent_specimen_id"):
+            root = self.repository.require_specimen(int(root["parent_specimen_id"]))
+            if int(root["id"]) in seen:
+                break
+            seen.add(int(root["id"]))
+        members: list[dict[str, Any]] = []
+        queue = [root]
+        visited: set[int] = set()
+        while queue:
+            node = queue.pop()
+            if int(node["id"]) in visited:
+                continue
+            visited.add(int(node["id"]))
+            members.append(node)
+            queue.extend(records(self.connection.execute(
+                "SELECT * FROM specimens WHERE parent_specimen_id=? ORDER BY id", (node["id"],)
+            ).fetchall()))
+        member_ids = [int(item["id"]) for item in members]
+        placeholders = ",".join("?" for _ in member_ids)
+        ledger_rows = self.connection.execute(
+            f"SELECT specimen_id,COALESCE(SUM(quantity),0) FROM custody_events WHERE specimen_id IN ({placeholders}) "
+            f"AND movement_type IN ({_movement_clause(LEDGER_MOVEMENT_TYPES)}) GROUP BY specimen_id",
+            member_ids,
+        ).fetchall()
+        ledger_totals = {int(row[0]): float(row[1]) for row in ledger_rows}
+        member_reports: list[dict[str, Any]] = []
+        ledgers_match = True
+        for item in sorted(members, key=lambda entry: int(entry["id"])):
+            expected = round(float(item["initial_quantity"]) + ledger_totals.get(int(item["id"]), 0.0), 6)
+            matches = abs(float(item["available_quantity"]) - expected) < 1e-6
+            ledgers_match = ledgers_match and matches
+            member_reports.append({
+                "specimen_id": int(item["id"]),
+                "specimen_no": item["specimen_no"],
+                "recorded_available_grams": item["available_quantity"],
+                "expected_available_grams": expected,
+                "available_matches_ledger": matches,
+            })
+        consumed = float(self.connection.execute(
+            f"SELECT COALESCE(SUM(-quantity),0) FROM custody_events WHERE specimen_id IN ({placeholders}) "
+            f"AND movement_type IN ({_movement_clause(CONSUMPTION_MOVEMENT_TYPES)})",
+            member_ids,
+        ).fetchone()[0])
+        splits = self.repository.splits_for_lineage(member_ids)
+        total_available = round(sum(float(item["available_quantity"]) for item in members), 6)
+        root_initial = float(root["initial_quantity"])
+        conserved = ledgers_match and abs(root_initial - (total_available + consumed)) < 1e-6
+        return {
+            "root_specimen_id": int(root["id"]),
+            "member_count": len(members),
+            "members": member_reports,
+            "root_initial_grams": root_initial,
+            "total_available_grams": total_available,
+            "net_consumed_grams": round(consumed, 6),
+            "split_total_grams": round(sum(float(split["quantity"]) for split in splits), 6),
+            "conserved": conserved,
         }

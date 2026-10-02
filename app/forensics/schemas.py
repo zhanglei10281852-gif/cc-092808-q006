@@ -138,6 +138,29 @@ class SpecimenCreate(BaseModel):
         return value.strip().upper()
 
 
+class SpecimenSplitCreate(BaseModel):
+    specimen_no: str = Field(min_length=3, max_length=60)
+    quantity: float = Field(gt=0, le=10_000_000)
+    expected_version: int = Field(gt=0)
+    idempotency_key: str = Field(min_length=8, max_length=100)
+    reason: str = Field(min_length=2, max_length=300)
+    actor: str = Field(min_length=1, max_length=100)
+    packaging: str = Field(min_length=2, max_length=500)
+    sealed_on: date
+    integrity_percent: float | None = Field(default=None, ge=0, le=100)
+    received_year: int | None = Field(default=None, ge=1800, le=2200)
+
+    @field_validator("specimen_no")
+    @classmethod
+    def normalize_specimen_no(cls, value: str) -> str:
+        return value.strip().upper()
+
+    @field_validator("reason", "actor", "packaging")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+
 class PlacementCreate(BaseModel):
     specimen_id: int = Field(gt=0)
     location_id: int = Field(gt=0)

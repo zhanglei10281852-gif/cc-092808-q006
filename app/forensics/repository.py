@@ -128,11 +128,31 @@ class ForensicRepository:
         item["holds"] = records(self.connection.execute(
             "SELECT * FROM specimen_holds WHERE specimen_id=? ORDER BY id", (specimen_id,)
         ).fetchall())
+        item["splits"] = records(self.connection.execute(
+            "SELECT t.*,c.specimen_no AS child_specimen_no FROM specimen_splits t "
+            "JOIN specimens c ON c.id=t.child_specimen_id WHERE t.parent_specimen_id=? ORDER BY t.id", (specimen_id,)
+        ).fetchall())
+        item["origin_split"] = record(self.connection.execute(
+            "SELECT t.*,p.specimen_no AS parent_specimen_no FROM specimen_splits t "
+            "JOIN specimens p ON p.id=t.parent_specimen_id WHERE t.child_specimen_id=?", (specimen_id,)
+        ).fetchone())
         item["latest_examination"] = record(self.connection.execute(
             "SELECT * FROM examinations WHERE specimen_id=? AND status='completed' ORDER BY completed_at DESC,id DESC LIMIT 1",
             (specimen_id,),
         ).fetchone())
         return item
+
+    def split_by_key(self, split_key: str) -> dict[str, Any] | None:
+        return record(self.connection.execute("SELECT * FROM specimen_splits WHERE split_key=?", (split_key,)).fetchone())
+
+    def splits_for_lineage(self, specimen_ids: list[int]) -> list[dict[str, Any]]:
+        if not specimen_ids:
+            return []
+        placeholders = ",".join("?" for _ in specimen_ids)
+        return records(self.connection.execute(
+            f"SELECT * FROM specimen_splits WHERE parent_specimen_id IN ({placeholders}) ORDER BY id",
+            specimen_ids,
+        ).fetchall())
 
     def require_placement(self, placement_id: int) -> dict[str, Any]:
         item = record(self.connection.execute("SELECT * FROM specimen_placements WHERE id=?", (placement_id,)).fetchone())

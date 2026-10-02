@@ -20,6 +20,7 @@ from app.forensics.schemas import (
     HoldRelease,
     LocationCreate,
     SpecimenCreate,
+    SpecimenSplitCreate,
     MovePlacement,
     PlacementCreate,
     PolicyCreate,
@@ -152,6 +153,13 @@ def create_specimen(data: SpecimenCreate, principal: Principal = Depends(current
     principal.require("custody.write")
     with transaction(immediate=True) as connection:
         return ForensicService(connection).custody.create_specimen(data.model_dump(mode="json"))
+
+
+@router.post("/specimens/{specimen_id}/splits", status_code=201)
+def split_specimen(specimen_id: int, data: SpecimenSplitCreate, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("custody.write")
+    with transaction(immediate=True) as connection:
+        return ForensicService(connection).custody.split_specimen(specimen_id, data.model_dump(mode="json"))
 
 
 @router.get("/specimens/{specimen_id}")
